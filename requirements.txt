@@ -1,0 +1,10 @@
+# head3Dv1 — DICOM 結合支援ソフト
+# 注意: この venv は --system-site-packages なしのクリーン環境。
+#       Anaconda base の PyQt5 は使わず、Qt スタックを PyPI 版で統一する。
+vtk>=9.7,<10
+PyQt5>=5.15.11,<6
+pydicom>=3.0,<4
+numpy>=1.26,<2
+scipy>=1.13
+scikit-image>=0.24
+pytest>=8.0
