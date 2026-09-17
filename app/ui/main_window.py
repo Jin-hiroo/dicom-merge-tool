@@ -24,8 +24,8 @@ from app.ui.align_panel import AlignPanel
 from app.ui.merge_panel import MergePanel
 from app.ui.progress_bar import ProgressBar
 from app.ui.segment_panel import SegmentPanel
-from app.ui.series_panel import (ROLE_FIXED, ROLE_MOVING, SeriesEntry,
-                                 SeriesPanel)
+from app.ui.series_panel import (PREVIEW_KEY, ROLE_FIXED, ROLE_MOVING,
+                                 SeriesEntry, SeriesPanel)
 from app.ui.viewer2d import Viewer2D
 from app.ui.viewer3d import VIEW_DIRECTIONS, Viewer3D
 from app.workers.base import TaskRunner
@@ -63,7 +63,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.runner = TaskRunner(self)
         self.metric: SurfaceMetric | None = None
         self._pending_role: str | None = None
-        self._preview = {}      # role -> {"poly","volume","preview_volume"}
+        # 表示キー -> {"poly","volume","preview_volume"}。
+        # キーは ROLE_FIXED / ROLE_MOVING / PREVIEW_KEY。
+        self._meshes = {}
         self._last_grid = None
 
         self._build_ui()
@@ -214,15 +216,21 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addSpacing(12)
         self.show_fixed = QtWidgets.QCheckBox("Fixed")
         self.show_moving = QtWidgets.QCheckBox("Moving")
-        self.show_fixed.setChecked(True)
-        self.show_moving.setChecked(True)
+        self.show_preview = QtWidgets.QCheckBox("プレビュー")
+        for cb in (self.show_fixed, self.show_moving, self.show_preview):
+            cb.setChecked(True)
         self.show_fixed.toggled.connect(
             lambda v: self.viewer3d.set_visible(ROLE_FIXED, v))
         self.show_moving.toggled.connect(
             lambda v: self.viewer3d.set_visible(ROLE_MOVING, v))
+        self.show_preview.toggled.connect(
+            lambda v: self.viewer3d.set_visible(PREVIEW_KEY, v))
+        self.show_preview.setEnabled(False)
         row.addWidget(self.show_fixed)
         row.addSpacing(8)
         row.addWidget(self.show_moving)
+        row.addSpacing(8)
+        row.addWidget(self.show_preview)
 
         row.addSpacing(10)
         row.addWidget(QtWidgets.QLabel("透過"))
@@ -264,6 +272,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.series_panel.load_requested.connect(self.on_load_series)
         self.series_panel.roles_changed.connect(self.on_roles_changed)
         self.series_panel.remove_requested.connect(self.on_remove_entry)
+        self.series_panel.preview_changed.connect(self.on_preview_changed)
 
         self.segment_panel.apply_requested.connect(self.rebuild_previews)
         self.segment_panel.threshold_preview.connect(self.on_threshold_preview)
@@ -296,7 +305,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     lambda a=axis, s=sign, b=big: self._shortcut_nudge(a, s, b))
 
     def _shortcut_nudge(self, axis, sign, big):
-        if self.runner.busy or ROLE_MOVING not in self._preview:
+        if self.runner.busy or ROLE_MOVING not in self._meshes:
             return
         self.align_panel.nudge_by_key(axis, sign, big)
 
@@ -400,7 +409,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._suspend_rebuild = False
 
     def _qsettings(self):
-        return QtCore.QSettings("head3Dv1", "head3Dv1")
+        """設定の保存先。
+
+        HEAD3DV1_SETTINGS_SCOPE で切り替えられる。自動テストがユーザーの
+        実際の環境設定 (閾値やブレンド方式) を上書きしないようにするため。
+        """
+        scope = os.environ.get("HEAD3DV1_SETTINGS_SCOPE") or "head3Dv1"
+        return QtCore.QSettings("head3Dv1", scope)
 
     def _restore_settings(self):
         """ウィンドウ位置と各パネルの設定を前回終了時の状態に戻す。"""
@@ -505,7 +520,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.series_panel.entries.clear()
         self.viewer3d.clear()
-        self._preview.clear()
+        self._meshes.clear()
+        # 復元後のシリーズは previewed=False なので、表示状態も揃えておく
+        self.show_preview.setEnabled(False)
 
         entries = []
         for rec in data["entries"]:
@@ -608,11 +625,16 @@ class MainWindow(QtWidgets.QMainWindow):
         entry = self.series_panel.entry(index)
         if entry is None:
             return
-        role = entry.role
+        role, was_previewed = entry.role, entry.previewed
         self.series_panel.remove_entry(index)
+        if was_previewed:
+            self._meshes.pop(PREVIEW_KEY, None)
+            self.viewer3d.remove_surface(PREVIEW_KEY)
+            self.show_preview.setEnabled(False)
         if role:
-            self._preview.pop(role, None)
+            self._meshes.pop(role, None)
             self.viewer3d.remove_surface(role)
+        if role or was_previewed:
             self.on_roles_changed()
 
     # ==================================================================
@@ -621,66 +643,124 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_roles_changed(self):
         for role in (ROLE_FIXED, ROLE_MOVING):
             if self.series_panel.by_role(role) is None:
-                self._preview.pop(role, None)
+                self._meshes.pop(role, None)
                 self.viewer3d.remove_surface(role)
         self.rebuild_previews()
+
+    def on_preview_changed(self):
+        """単体プレビューの対象が変わったとき。
+
+        Fixed / Moving のメッシュは作り直さず、プレビュー分だけ更新する。
+        位置合わせ中に押しても作業が巻き戻らないようにするため。
+        """
+        entry = self.series_panel.previewed_entry()
+        if entry is None:
+            self._meshes.pop(PREVIEW_KEY, None)
+            self.viewer3d.remove_surface(PREVIEW_KEY)
+            self.show_preview.setEnabled(False)
+            self.statusBar().showMessage("プレビューを閉じました")
+            self._update_actions()
+            return
+
+        self.show_preview.setEnabled(True)
+        if not self.show_preview.isChecked():
+            self.show_preview.setChecked(True)
+        self._focus_preview_when_ready = True
+        self._mesh_queue = [PREVIEW_KEY]
+        self._next_mesh()
 
     def on_threshold_preview(self, value: int):
         self.viewer2d.set_threshold(value)
         self.statusBar().showMessage(
             f"HU 閾値 {value} — [再セグメント] で 3D プレビューに反映されます")
 
+    def _entry_for(self, key: str):
+        """表示キーに対応するシリーズを返す。"""
+        if key == PREVIEW_KEY:
+            return self.series_panel.previewed_entry()
+        return self.series_panel.by_role(key)
+
+    @staticmethod
+    def _label_for(key: str) -> str:
+        return {ROLE_FIXED: "Fixed", ROLE_MOVING: "Moving",
+                PREVIEW_KEY: "プレビュー"}.get(key, key)
+
     def rebuild_previews(self):
         if self.runner.busy or getattr(self, "_suspend_rebuild", False):
             return
-        roles = [r for r in (ROLE_FIXED, ROLE_MOVING)
-                 if self.series_panel.by_role(r) is not None]
-        if not roles:
+        keys = [k for k in (ROLE_FIXED, ROLE_MOVING, PREVIEW_KEY)
+                if self._entry_for(k) is not None]
+        # 表示対象から外れたものは畳んでおく
+        for k in (ROLE_FIXED, ROLE_MOVING, PREVIEW_KEY):
+            if k not in keys:
+                self._meshes.pop(k, None)
+                self.viewer3d.remove_surface(k)
+        if not keys:
             self.viewer3d.clear()
             self.viewer2d.clear()
             self._update_actions()
             return
-        self._mesh_queue = list(roles)
+        self._mesh_queue = list(keys)
         self._next_mesh()
 
     def _next_mesh(self):
         if not getattr(self, "_mesh_queue", None):
             self._after_previews()
             return
-        role = self._mesh_queue.pop(0)
-        entry = self.series_panel.by_role(role)
+        key = self._mesh_queue.pop(0)
+        entry = self._entry_for(key)
         if entry is None or not entry.loaded:
             self._next_mesh()
             return
-        self._pending_role = role
+        self._pending_role = key
         worker = MeshWorker(
-            role, entry.volume, self.segment_panel.threshold,
+            key, entry.volume, self.segment_panel.threshold,
             largest_component=self.segment_panel.use_largest_component,
             min_island_voxels=self.segment_panel.min_island_voxels,
             scratch_dir=config.SCRATCH_DIR)
-        label = "Fixed" if role == ROLE_FIXED else "Moving"
-        self._start(worker, self._on_mesh_done, f"{label} のプレビューを生成中…")
+        self._start(worker, self._on_mesh_done,
+                    f"{self._label_for(key)} のプレビューを生成中…")
 
     def _on_mesh_done(self, result):
         if result is None:
             self._mesh_queue = []
             return
-        role = result["role"]
-        self._preview[role] = result
+        key = result["role"]
+        self._meshes[key] = result
 
-        color = config.COLOR_FIXED if role == ROLE_FIXED else config.COLOR_MOVING
-        opacity = (config.OPACITY_FIXED if role == ROLE_FIXED
-                   else self.moving_opacity.value() / 100.0)
-        self.viewer3d.set_surface(role, result["poly"], color, opacity)
+        color, opacity = {
+            ROLE_FIXED: (config.COLOR_FIXED, config.OPACITY_FIXED),
+            ROLE_MOVING: (config.COLOR_MOVING,
+                          self.moving_opacity.value() / 100.0),
+            PREVIEW_KEY: (config.COLOR_PREVIEW, config.OPACITY_PREVIEW),
+        }.get(key, (config.COLOR_MERGED, 1.0))
+        self.viewer3d.set_surface(key, result["poly"], color, opacity)
+        if key == PREVIEW_KEY:
+            self.viewer3d.set_visible(PREVIEW_KEY, self.show_preview.isChecked())
 
         n = result["poly"].GetNumberOfPolys()
         self.statusBar().showMessage(
-            f"{role} プレビュー: {n:,} 三角形 (1/{result['factor']} に縮小)")
+            f"{self._label_for(key)}: {n:,} 三角形 "
+            f"(1/{result['factor']} に縮小)")
         self._next_mesh()
 
     def _after_previews(self):
-        fixed = self._preview.get(ROLE_FIXED)
-        moving = self._preview.get(ROLE_MOVING)
+        # 単体プレビューを点けた直後は、そこへカメラを寄せて確実に見えるようにする
+        # (別々に撮った CT は患者座標上で遠く離れていることがある)
+        if getattr(self, "_focus_preview_when_ready", False):
+            self._focus_preview_when_ready = False
+            # CT は体軸に長いので、正面 (A) から見ないと形が読めない
+            if self.viewer3d.focus_on(PREVIEW_KEY, view="前 (A)"):
+                entry = self.series_panel.previewed_entry()
+                self.statusBar().showMessage(
+                    f"プレビュー表示: {entry.title if entry else ''}"
+                    "  — [全体表示] で元の視点に戻せます")
+            self.on_transform_changed()
+            self._update_actions()
+            return
+
+        fixed = self._meshes.get(ROLE_FIXED)
+        moving = self._meshes.get(ROLE_MOVING)
 
         if moving is not None:
             self._set_rotation_center(moving["poly"])
@@ -821,7 +901,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             role=ROLE_FIXED, meta=info)
         self.series_panel.add_entries([entry])
 
-        self._preview.pop(ROLE_MOVING, None)
+        self._meshes.pop(ROLE_MOVING, None)
         self.viewer3d.remove_surface(ROLE_MOVING)
         self.align_panel.transform.reset()
         self.align_panel.clear_history()

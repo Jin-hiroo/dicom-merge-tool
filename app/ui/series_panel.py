@@ -8,6 +8,8 @@ from PyQt5 import QtCore, QtWidgets
 from app.core.memory import human
 
 ROLE_NONE, ROLE_FIXED, ROLE_MOVING = "", "fixed", "moving"
+# 役割とは別枠。Fixed/Moving を割り当てずに単体で 3D 確認するための表示。
+PREVIEW_KEY = "preview"
 
 
 @dataclass
@@ -18,6 +20,7 @@ class SeriesEntry:
     volume: object = None        # Volume (読込済みなら)
     merged: bool = False
     role: str = ROLE_NONE
+    previewed: bool = False      # 単体プレビュー中か (同時に 1 件だけ)
     meta: dict = field(default_factory=dict)
     # セッション復元用: 元 DICOM の在り処 ({"folder":…, "series_uid":…})。
     # 元シリーズは数 GB になりうるのでセッションには実体を持たず、ここから読み直す。
@@ -49,6 +52,7 @@ class SeriesPanel(QtWidgets.QGroupBox):
     load_requested = QtCore.pyqtSignal(int)         # entry index
     roles_changed = QtCore.pyqtSignal()
     remove_requested = QtCore.pyqtSignal(int)
+    preview_changed = QtCore.pyqtSignal()           # 単体プレビューの対象が変わった
 
     def __init__(self, parent=None):
         super().__init__("シリーズ", parent)
@@ -82,6 +86,13 @@ class SeriesPanel(QtWidgets.QGroupBox):
         self.load_btn.clicked.connect(
             lambda: self.load_requested.emit(self.list.currentRow()))
         layout.addWidget(self.load_btn)
+
+        self.preview_btn = QtWidgets.QPushButton("プレビュー表示")
+        self.preview_btn.setToolTip(
+            "選択中のシリーズを、役割を割り当てずに単体で 3D 表示する。\n"
+            "位置合わせ中の Fixed / Moving はそのまま維持される。")
+        self.preview_btn.clicked.connect(self._toggle_preview)
+        layout.addWidget(self.preview_btn)
 
         role_row = QtWidgets.QHBoxLayout()
         self.fixed_btn = QtWidgets.QPushButton("Fixed に設定")
@@ -136,6 +147,8 @@ class SeriesPanel(QtWidgets.QGroupBox):
         self.list.clear()
         for e in self.entries:
             tag = {ROLE_FIXED: "  [Fixed]", ROLE_MOVING: "  [Moving]"}.get(e.role, "")
+            if e.previewed:
+                tag += "  [表示中]"
             mark = "●" if e.loaded else "○"
             prefix = "⧉ " if e.merged else ""
             item = QtWidgets.QListWidgetItem(f"{mark} {prefix}{e.title}{tag}")
@@ -162,6 +175,38 @@ class SeriesPanel(QtWidgets.QGroupBox):
         self.refresh()
         self.roles_changed.emit()
 
+    def _toggle_preview(self):
+        """選択中のシリーズの単体プレビューを入/切する。
+
+        同時に見えるのは 1 件だけ。3D ビューが何色もの重なりで
+        読めなくなるのを避けるため。
+        """
+        entry = self.current_entry()
+        if entry is None or not entry.loaded:
+            return
+        turning_on = not entry.previewed
+        for e in self.entries:
+            e.previewed = False
+        entry.previewed = turning_on
+        self.refresh()
+        self.preview_changed.emit()
+
+    def previewed_entry(self):
+        for e in self.entries:
+            if e.previewed:
+                return e
+        return None
+
+    def clear_preview(self):
+        changed = False
+        for e in self.entries:
+            if e.previewed:
+                e.previewed = False
+                changed = True
+        if changed:
+            self.refresh()
+        return changed
+
     def _clear_role(self):
         entry = self.current_entry()
         if entry is None or not entry.role:
@@ -184,6 +229,9 @@ class SeriesPanel(QtWidgets.QGroupBox):
         self.moving_btn.setEnabled(loaded)
         self.remove_btn.setEnabled(has)
         self.clear_role_btn.setEnabled(bool(entry and entry.role))
+        self.preview_btn.setEnabled(loaded)
+        self.preview_btn.setText(
+            "プレビューを閉じる" if (entry and entry.previewed) else "プレビュー表示")
         if loaded:
             self.load_btn.setText("読み込み済み")
         else:

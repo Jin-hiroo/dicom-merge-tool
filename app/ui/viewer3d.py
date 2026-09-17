@@ -164,6 +164,30 @@ class Viewer3D(QtWidgets.QWidget):
         self.renderer.ResetCamera()
         self.render()
 
+    def focus_on(self, role: str, view: str | None = None) -> bool:
+        """指定したサーフェスが画面に収まるようカメラを合わせる。
+
+        別々に撮った CT は患者座標上で遠く離れていることがあり、単に表示
+        しただけでは画面外で「何も出ない」ように見えるため。
+
+        ``view`` を渡すとその方向から見る。CT は体軸 (Z) に長いので、
+        既定の Z 方向のままだと筒を真上から覗く形になり何も分からない。
+        """
+        actor = self._actors.get(role)
+        if actor is None:
+            return False
+        bounds = actor.GetBounds()
+        if bounds[1] < bounds[0]:
+            return False
+        # 先に一度フィットして焦点と距離を確定させてから向きを変え、再フィットする
+        self.renderer.ResetCamera(bounds)
+        if view:
+            self.set_view(view)
+            self.renderer.ResetCamera(bounds)
+        self.renderer.ResetCameraClippingRange()
+        self.render()
+        return True
+
     def set_view(self, name: str):
         spec = VIEW_DIRECTIONS.get(name)
         if spec is None:

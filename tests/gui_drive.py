@@ -27,6 +27,8 @@ OUT.mkdir(parents=True, exist_ok=True)
 # 起動時のセッション復元プロンプトはこの検証の対象外なので抑止する
 # (これを忘れると、復元がシリーズ一覧を差し替えてしまう)
 os.environ["HEAD3DV1_NO_RESTORE"] = "1"
+# ユーザーの実際の環境設定を自動テストが上書きしないよう別スコープにする
+os.environ["HEAD3DV1_SETTINGS_SCOPE"] = "test-gui-drive"
 
 _ticks = 0
 

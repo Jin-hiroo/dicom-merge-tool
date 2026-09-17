@@ -45,8 +45,12 @@ DEFAULT_ROTATE_STEP = 1.0
 COLOR_FIXED = (0.92, 0.88, 0.78)    # アイボリー
 COLOR_MOVING = (0.30, 0.78, 0.90)   # シアン
 COLOR_MERGED = (0.85, 0.85, 0.88)
+# 役割を割り当てずに単体で確認するためのプレビュー色。
+# Fixed(アイボリー) / Moving(シアン) のどちらとも見分けがつく色にする。
+COLOR_PREVIEW = (0.78, 0.55, 0.95)  # 紫
 OPACITY_FIXED = 1.0
 OPACITY_MOVING = 0.55
+OPACITY_PREVIEW = 1.0
 
 BLEND_MODES = ["feather (推奨)", "max", "mean"]
 DEFAULT_BLEND = "feather (推奨)"
