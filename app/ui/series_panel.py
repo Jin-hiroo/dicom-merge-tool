@@ -3,13 +3,76 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
+from app import config
 from app.core.memory import human
 
 ROLE_NONE, ROLE_FIXED, ROLE_MOVING = "", "fixed", "moving"
 # 役割とは別枠。Fixed/Moving を割り当てずに単体で 3D 確認するための表示。
 PREVIEW_KEY = "preview"
+
+# 色を指定していないシリーズが、表示スロットごとに使う既定色。
+DEFAULT_COLORS = {
+    ROLE_FIXED: config.COLOR_FIXED,
+    ROLE_MOVING: config.COLOR_MOVING,
+    PREVIEW_KEY: config.COLOR_PREVIEW,
+}
+
+
+def display_key(entry, preview_entry=None) -> str:
+    """その行が今どの表示スロットで出ているか。どこにも出ていなければ ""。
+
+    プレビューは独立したモードになり「どの行を見ているか」はパネル側が持つので、
+    entry 単体では判定できない。現在プレビュー中の行を渡してもらう。
+    """
+    if entry is None:
+        return ""
+    # プレビュー対象を役割より優先する。プレビューモードでは役割の有無に関わらず
+    # プレビュースロットで描画されるため。位置合わせモードでは preview_entry が
+    # None になるので、そのときは役割に落ちる。
+    if preview_entry is not None and entry is preview_entry:
+        return PREVIEW_KEY
+    return entry.role or ""
+
+
+def color_for_key(entry, key: str) -> tuple:
+    """表示キーに使う色。シリーズに指定色があればそれを優先する。
+
+    未指定なら役割ごとの既定色に落ちる。どのスロットにも出ていない行は
+    「表示したときに役割の色になる」という意味でニュートラルな灰を返す。
+    """
+    if entry is not None and entry.color:
+        return tuple(entry.color)
+    return DEFAULT_COLORS.get(key, config.COLOR_MERGED)
+
+
+def normalize_color(value) -> tuple | None:
+    """セッション JSON 由来の色を (r,g,b) float へ正規化する。
+
+    手で編集されたマニフェストでも落ちないよう、壊れていれば None
+    (= 既定色) として扱う。
+    """
+    if value is None:
+        return None
+    try:
+        rgb = [float(v) for v in value]
+    except (TypeError, ValueError):
+        return None
+    if len(rgb) != 3:
+        return None
+    return tuple(min(max(c, 0.0), 1.0) for c in rgb)
+
+
+def color_icon(color, size: int = 12) -> QtGui.QIcon:
+    """色見本のアイコン。DARK_QSS の影響を受けないよう描画で作る。"""
+    pix = QtGui.QPixmap(size, size)
+    pix.fill(QtGui.QColor.fromRgbF(*color))
+    painter = QtGui.QPainter(pix)
+    painter.setPen(QtGui.QColor("#0d0f13"))
+    painter.drawRect(0, 0, size - 1, size - 1)
+    painter.end()
+    return QtGui.QIcon(pix)
 
 
 @dataclass
@@ -20,6 +83,8 @@ class SeriesEntry:
     volume: object = None        # Volume (読込済みなら)
     merged: bool = False
     role: str = ROLE_NONE
+    # 3D の表示色 (r,g,b) 0.0-1.0。None なら表示スロットごとの既定色を使う。
+    color: tuple | None = None
     meta: dict = field(default_factory=dict)
     # セッション復元用: 元 DICOM の在り処 ({"folder":…, "series_uid":…})。
     # 元シリーズは数 GB になりうるのでセッションには実体を持たず、ここから読み直す。
@@ -52,10 +117,12 @@ class SeriesPanel(QtWidgets.QGroupBox):
     roles_changed = QtCore.pyqtSignal()
     remove_requested = QtCore.pyqtSignal(int)
     selection_changed = QtCore.pyqtSignal(int)      # 選択行が変わった (プレビュー用)
+    color_changed = QtCore.pyqtSignal(int)          # entry index (表示色のみ変更)
 
     def __init__(self, parent=None):
         super().__init__("シリーズ", parent)
         self.entries: list[SeriesEntry] = []
+        self._preview_entry = None   # プレビューモードで表示中の行
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(6)
@@ -70,6 +137,7 @@ class SeriesPanel(QtWidgets.QGroupBox):
         self.list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.list.setTextElideMode(QtCore.Qt.ElideMiddle)
         self.list.setWordWrap(False)
+        self.list.setIconSize(QtCore.QSize(12, 12))
         self.list.currentRowChanged.connect(self._on_selection)
         layout.addWidget(self.list, 1)
 
@@ -85,6 +153,14 @@ class SeriesPanel(QtWidgets.QGroupBox):
         self.load_btn.clicked.connect(
             lambda: self.load_requested.emit(self.list.currentRow()))
         layout.addWidget(self.load_btn)
+
+        self.color_btn = QtWidgets.QPushButton("表示色…")
+        self.color_btn.setToolTip(
+            "選択中のシリーズを 3D で表示するときの色を決める。\n"
+            "Fixed / Moving / プレビューのどれで表示されても、この色が使われる。")
+        self.color_btn.clicked.connect(self._choose_color)
+        layout.addWidget(self.color_btn)
+
 
         role_row = QtWidgets.QHBoxLayout()
         self.fixed_btn = QtWidgets.QPushButton("Fixed に設定")
@@ -133,6 +209,17 @@ class SeriesPanel(QtWidgets.QGroupBox):
                 return e
         return None
 
+    def display_key(self, entry) -> str:
+        """その行が今どの表示スロットで出ているか (プレビュー対象を加味する)。"""
+        return display_key(entry, self._preview_entry)
+
+    def set_preview_entry(self, entry):
+        """プレビューモードで表示中の行。色見本の解決に使う。"""
+        if entry is self._preview_entry:
+            return
+        self._preview_entry = entry
+        self.refresh()
+
     def refresh(self):
         row = self.list.currentRow()
         self.list.blockSignals(True)
@@ -142,6 +229,7 @@ class SeriesPanel(QtWidgets.QGroupBox):
             mark = "●" if e.loaded else "○"
             prefix = "⧉ " if e.merged else ""
             item = QtWidgets.QListWidgetItem(f"{mark} {prefix}{e.title}{tag}")
+            item.setIcon(color_icon(color_for_key(e, self.display_key(e))))
             item.setToolTip(f"{e.title}\n{e.detail()}")
             self.list.addItem(item)
         self.list.blockSignals(False)
@@ -173,6 +261,46 @@ class SeriesPanel(QtWidgets.QGroupBox):
         self.refresh()
         self.roles_changed.emit()
 
+    def _choose_color(self):
+        """パレットから選ぶ。末尾から任意色 / 既定へのリセットもできる。"""
+        entry = self.current_entry()
+        if entry is None:
+            return
+        current = color_for_key(entry, self.display_key(entry))
+
+        menu = QtWidgets.QMenu(self)
+        for name, rgb in config.SERIES_COLOR_PRESETS:
+            act = menu.addAction(color_icon(rgb, 14), name)
+            act.setData(tuple(rgb))
+        menu.addSeparator()
+        custom_act = menu.addAction("その他の色…")
+        reset_act = menu.addAction("既定に戻す")
+        reset_act.setEnabled(entry.color is not None)
+
+        chosen = menu.exec_(self.color_btn.mapToGlobal(
+            QtCore.QPoint(0, self.color_btn.height())))
+        if chosen is None:
+            return
+        if chosen is reset_act:
+            self._apply_color(None)
+        elif chosen is custom_act:
+            c = QtWidgets.QColorDialog.getColor(
+                QtGui.QColor.fromRgbF(*current), self, "表示色を選択")
+            if c.isValid():
+                self._apply_color((c.redF(), c.greenF(), c.blueF()))
+        else:
+            self._apply_color(chosen.data())
+
+    def _apply_color(self, color):
+        """選んだ色をシリーズへ反映する。メッシュは作り直さない。"""
+        row = self.list.currentRow()
+        entry = self.entry(row)
+        if entry is None or entry.color == color:
+            return
+        entry.color = color
+        self.refresh()
+        self.color_changed.emit(row)
+
     def _on_selection(self, row: int):
         entry = self.entry(row)
         self.detail.setText(entry.detail() if entry else "—")
@@ -194,7 +322,11 @@ class SeriesPanel(QtWidgets.QGroupBox):
         self.moving_btn.setEnabled(loaded)
         self.remove_btn.setEnabled(has)
         self.clear_role_btn.setEnabled(bool(entry and entry.role))
-
+        # 色は未読込でも先に決めておける (表示したときに効く)
+        self.color_btn.setEnabled(has)
+        self.color_btn.setIcon(
+            color_icon(color_for_key(entry, self.display_key(entry)), 14)
+            if has else QtGui.QIcon())
         if loaded:
             self.load_btn.setText("読み込み済み")
         else:

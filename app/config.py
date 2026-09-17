@@ -52,6 +52,19 @@ OPACITY_FIXED = 1.0
 OPACITY_MOVING = 0.55
 OPACITY_PREVIEW = 1.0
 
+# シリーズごとの表示色を選ぶときの候補 (表示名 -> RGB)。
+# 暗いグラデーション背景の上で互いに判別でき、かつ既定色 3 色と衝突しない並び。
+SERIES_COLOR_PRESETS = [
+    ("アイボリー", COLOR_FIXED),
+    ("シアン", COLOR_MOVING),
+    ("紫", COLOR_PREVIEW),
+    ("赤", (0.90, 0.38, 0.38)),
+    ("緑", (0.45, 0.82, 0.48)),
+    ("橙", (0.95, 0.66, 0.30)),
+    ("黄", (0.93, 0.88, 0.40)),
+    ("青", (0.42, 0.58, 0.95)),
+]
+
 BLEND_MODES = ["feather (推奨)", "max", "mean"]
 DEFAULT_BLEND = "feather (推奨)"
 
