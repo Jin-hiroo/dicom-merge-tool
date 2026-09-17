@@ -203,6 +203,30 @@ class Viewer3D(QtWidgets.QWidget):
         self.renderer.ResetCameraClippingRange()
         self.render()
 
+    def save_camera(self) -> dict:
+        """現在の視点を保存する。モードを往復しても視点を失わないため。"""
+        cam = self.renderer.GetActiveCamera()
+        return {
+            "position": tuple(cam.GetPosition()),
+            "focal_point": tuple(cam.GetFocalPoint()),
+            "view_up": tuple(cam.GetViewUp()),
+            "parallel_scale": float(cam.GetParallelScale()),
+            "view_angle": float(cam.GetViewAngle()),
+        }
+
+    def restore_camera(self, state: dict | None) -> bool:
+        if not state:
+            return False
+        cam = self.renderer.GetActiveCamera()
+        cam.SetPosition(*state["position"])
+        cam.SetFocalPoint(*state["focal_point"])
+        cam.SetViewUp(*state["view_up"])
+        cam.SetParallelScale(state.get("parallel_scale", 1.0))
+        cam.SetViewAngle(state.get("view_angle", 30.0))
+        self.renderer.ResetCameraClippingRange()
+        self.render()
+        return True
+
     def render(self):
         self.interactor.GetRenderWindow().Render()
 

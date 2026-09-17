@@ -37,6 +37,14 @@ from app.workers.tasks import (DiceWorker, ExportDicomWorker, ExportWorker,
 
 log = logging.getLogger(__name__)
 
+# 2 つの排他的なモード。
+#   位置合わせ : Fixed + Moving を並べて重ね、結合に向けて追い込む
+#   プレビュー : 選択した 1 件 *だけ* を表示し、手持ちの DICOM の中身を確認する
+MODE_ALIGN, MODE_PREVIEW = "align", "preview"
+MODE_TABS = [("位置合わせ (Fixed / Moving)", MODE_ALIGN),
+             ("プレビュー (単体確認)", MODE_PREVIEW)]
+PREVIEW_DEBOUNCE_MS = 200
+
 DARK_QSS = """
 QWidget { background:#15171c; color:#d6dbe5; font-size:12px; }
 QGroupBox { border:1px solid #2a2d35; border-radius:6px; margin-top:10px; padding-top:8px; }
@@ -64,6 +72,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.runner = TaskRunner(self)
         self.metric: SurfaceMetric | None = None
         self._pending_role: str | None = None
+        self._mode = MODE_ALIGN
+        self._camera_by_mode: dict = {}
+        self._pending_preview = None          # 連打時に最後の要求だけ処理する
+        self._preview_entry = None            # プレビュー中に表示しているシリーズ
         # 表示キー -> {"poly","volume","preview_volume"}。
         # キーは ROLE_FIXED / ROLE_MOVING / PREVIEW_KEY。
         self._meshes = {}
@@ -136,6 +148,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tv = QtWidgets.QVBoxLayout(top)
         tv.setContentsMargins(0, 0, 0, 0)
         tv.setSpacing(4)
+        tv.addWidget(self._mode_tabs())
         tv.addWidget(self._view_toolbar())
         tv.addWidget(self.viewer3d, 1)
         center.addWidget(top)
@@ -198,6 +211,18 @@ class MainWindow(QtWidgets.QMainWindow):
         line.setStyleSheet("color:#2a2d35;")
         return line
 
+    def _mode_tabs(self) -> QtWidgets.QWidget:
+        self.mode_tabs = QtWidgets.QTabBar()
+        self.mode_tabs.setExpanding(False)
+        self.mode_tabs.setDrawBase(False)
+        for label, _ in MODE_TABS:
+            self.mode_tabs.addTab(label)
+        self.mode_tabs.setToolTip(
+            "位置合わせ: Fixed と Moving を重ねて結合に向けて調整する\n"
+            "プレビュー: 選択した 1 件だけを表示して中身を確認する")
+        self.mode_tabs.currentChanged.connect(self.on_mode_changed)
+        return self.mode_tabs
+
     def _view_toolbar(self) -> QtWidgets.QWidget:
         bar = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(bar)
@@ -215,23 +240,18 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(reset)
 
         row.addSpacing(12)
+        # 表示切替は位置合わせモード専用 (プレビューは 1 件だけなので不要)
         self.show_fixed = QtWidgets.QCheckBox("Fixed")
         self.show_moving = QtWidgets.QCheckBox("Moving")
-        self.show_preview = QtWidgets.QCheckBox("プレビュー")
-        for cb in (self.show_fixed, self.show_moving, self.show_preview):
+        for cb in (self.show_fixed, self.show_moving):
             cb.setChecked(True)
         self.show_fixed.toggled.connect(
             lambda v: self.viewer3d.set_visible(ROLE_FIXED, v))
         self.show_moving.toggled.connect(
             lambda v: self.viewer3d.set_visible(ROLE_MOVING, v))
-        self.show_preview.toggled.connect(
-            lambda v: self.viewer3d.set_visible(PREVIEW_KEY, v))
-        self.show_preview.setEnabled(False)
         row.addWidget(self.show_fixed)
         row.addSpacing(8)
         row.addWidget(self.show_moving)
-        row.addSpacing(8)
-        row.addWidget(self.show_preview)
 
         row.addSpacing(10)
         row.addWidget(QtWidgets.QLabel("透過"))
@@ -273,7 +293,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.series_panel.load_requested.connect(self.on_load_series)
         self.series_panel.roles_changed.connect(self.on_roles_changed)
         self.series_panel.remove_requested.connect(self.on_remove_entry)
-        self.series_panel.preview_changed.connect(self.on_preview_changed)
+        self.series_panel.selection_changed.connect(self.on_selection_changed)
         self.series_panel.color_changed.connect(self.on_series_color_changed)
 
         self.segment_panel.apply_requested.connect(self.rebuild_previews)
@@ -523,8 +543,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.series_panel.entries.clear()
         self.viewer3d.clear()
         self._meshes.clear()
-        # 復元後のシリーズは previewed=False なので、表示状態も揃えておく
-        self.show_preview.setEnabled(False)
+        self._set_preview_entry(None)
 
         entries = []
         for rec in data["entries"]:
@@ -628,16 +647,19 @@ class MainWindow(QtWidgets.QMainWindow):
         entry = self.series_panel.entry(index)
         if entry is None:
             return
-        role, was_previewed = entry.role, entry.previewed
+        role = entry.role
+        was_previewed = entry is self._preview_entry
         self.series_panel.remove_entry(index)
         if was_previewed:
+            self._set_preview_entry(None)
             self._meshes.pop(PREVIEW_KEY, None)
             self.viewer3d.remove_surface(PREVIEW_KEY)
-            self.show_preview.setEnabled(False)
         if role:
             self._meshes.pop(role, None)
             self.viewer3d.remove_surface(role)
-        if role or was_previewed:
+        if self.preview_mode:
+            self._request_preview(self.series_panel.current_entry())
+        elif role:
             self.on_roles_changed()
 
     # ==================================================================
@@ -650,27 +672,102 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.viewer3d.remove_surface(role)
         self.rebuild_previews()
 
-    def on_preview_changed(self):
-        """単体プレビューの対象が変わったとき。
+    # ==================================================================
+    # モード切替
+    # ==================================================================
+    @property
+    def preview_mode(self) -> bool:
+        return self._mode == MODE_PREVIEW
 
-        Fixed / Moving のメッシュは作り直さず、プレビュー分だけ更新する。
-        位置合わせ中に押しても作業が巻き戻らないようにするため。
-        """
-        entry = self.series_panel.previewed_entry()
-        if entry is None:
-            self._meshes.pop(PREVIEW_KEY, None)
-            self.viewer3d.remove_surface(PREVIEW_KEY)
-            self.show_preview.setEnabled(False)
-            self.statusBar().showMessage("プレビューを閉じました")
-            self._update_actions()
+    def on_mode_changed(self, index: int):
+        mode = MODE_TABS[max(0, min(index, len(MODE_TABS) - 1))][1]
+        if mode == self._mode:
             return
 
-        self.show_preview.setEnabled(True)
-        if not self.show_preview.isChecked():
-            self.show_preview.setChecked(True)
+        # 離れる前の視点を覚えておき、戻ったときに復元する
+        self._camera_by_mode[self._mode] = self.viewer3d.save_camera()
+        self._mode = mode
+
+        # ★メッシュは破棄しない。表示を切り替えるだけにして、モードを往復しても
+        #   再メッシュ化 (数秒〜) が走らないようにする。
+        for key in (ROLE_FIXED, ROLE_MOVING):
+            self.viewer3d.set_visible(key, not self.preview_mode and self._show(key))
+        self.viewer3d.set_visible(PREVIEW_KEY, self.preview_mode)
+
+        self.series_panel.set_mode(self.preview_mode)
+        for cb in (self.show_fixed, self.show_moving):
+            cb.setEnabled(not self.preview_mode)
+        self.merge_panel.set_align_widgets_visible(not self.preview_mode)
+        self.align_panel.setVisible(not self.preview_mode)
+        # 重なり誤差は位置合わせ専用の指標。プレビュー中に残っていると紛らわしい
+        if self.preview_mode:
+            self.progress.set_metric("")
+
+        if self.preview_mode:
+            self.statusBar().showMessage(
+                "プレビュー: 一覧でシリーズを選ぶと、それだけが表示されます")
+            self._request_preview(self.series_panel.current_entry())
+        else:
+            self._set_preview_entry(None)
+            self.viewer2d.set_volumes(
+                self._meshes.get(ROLE_FIXED, {}).get("preview_volume"),
+                self._meshes.get(ROLE_MOVING, {}).get("preview_volume"),
+                self.segment_panel.threshold)
+            self.viewer3d.restore_camera(self._camera_by_mode.get(MODE_ALIGN))
+            self.statusBar().showMessage("位置合わせモードに戻りました")
+            self.on_transform_changed()
+
+        self._update_actions()
+
+    def _show(self, key: str) -> bool:
+        return {ROLE_FIXED: self.show_fixed, ROLE_MOVING: self.show_moving}[
+            key].isChecked()
+
+    # ==================================================================
+    # 単体プレビュー (プレビューモード時のみ)
+    # ==================================================================
+    def on_selection_changed(self, row: int):
+        """プレビュー中は「選択＝即表示」。連打に耐えるようデバウンスする。"""
+        if not self.preview_mode:
+            return
+        entry = self.series_panel.entry(row)
+        if entry is None or not entry.loaded:
+            return
+        if getattr(self, "_preview_timer", None) is None:
+            self._preview_timer = QtCore.QTimer(self)
+            self._preview_timer.setSingleShot(True)
+            self._preview_timer.timeout.connect(self._fire_pending_preview)
+        self._pending_preview = entry
+        self._preview_timer.start(PREVIEW_DEBOUNCE_MS)
+
+    def _request_preview(self, entry):
+        self._pending_preview = entry
+        self._fire_pending_preview()
+
+    def _fire_pending_preview(self):
+        entry = self._pending_preview
+        if entry is None or not self.preview_mode:
+            return
+        if entry is None or not entry.loaded:
+            return
+        if self.runner.busy:
+            # 実行中なら中断させ、完了通知 (on_busy_changed) で最新の要求を処理する
+            self.runner.cancel()
+            return
+        self._pending_preview = None
+        self._set_preview_entry(entry)
+        self._start_preview_mesh(entry)
+
+    def _start_preview_mesh(self, entry):
+        worker = MeshWorker(
+            PREVIEW_KEY, entry.volume, self.segment_panel.threshold,
+            largest_component=self.segment_panel.use_largest_component,
+            min_island_voxels=self.segment_panel.min_island_voxels,
+            scratch_dir=config.SCRATCH_DIR)
         self._focus_preview_when_ready = True
-        self._mesh_queue = [PREVIEW_KEY]
-        self._next_mesh()
+        # プレビューは連打されうるので「処理中です」モーダルは出さない
+        self._start(worker, self._on_mesh_done,
+                    f"プレビューを生成中… {entry.title}", quiet=True)
 
     def on_series_color_changed(self, index: int):
         """表示色だけの変更。
@@ -691,10 +788,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(
             f"HU 閾値 {value} — [再セグメント] で 3D プレビューに反映されます")
 
+    def _set_preview_entry(self, entry):
+        """プレビュー対象を更新する。
+
+        一覧の色見本はどのスロットで表示中かによって色を決めるので、
+        パネル側にも同じ情報を渡しておく。
+        """
+        self._preview_entry = entry
+        self.series_panel.set_preview_entry(entry)
+
     def _entry_for(self, key: str):
         """表示キーに対応するシリーズを返す。"""
         if key == PREVIEW_KEY:
-            return self.series_panel.previewed_entry()
+            return self._preview_entry
         return self.series_panel.by_role(key)
 
     @staticmethod
@@ -705,15 +811,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def rebuild_previews(self):
         if self.runner.busy or getattr(self, "_suspend_rebuild", False):
             return
-        keys = [k for k in (ROLE_FIXED, ROLE_MOVING, PREVIEW_KEY)
-                if self._entry_for(k) is not None]
-        # 表示対象から外れたものは畳んでおく
-        for k in (ROLE_FIXED, ROLE_MOVING, PREVIEW_KEY):
+        # モードごとに必要な面だけを作る
+        wanted = ([PREVIEW_KEY] if self.preview_mode
+                  else [ROLE_FIXED, ROLE_MOVING])
+        keys = [k for k in wanted if self._entry_for(k) is not None]
+        # 表示対象から外れたものは畳む。ただし *他モードの* 面は再生成を避ける
+        # ため残しておき、表示だけ落とす。
+        for k in wanted:
             if k not in keys:
                 self._meshes.pop(k, None)
                 self.viewer3d.remove_surface(k)
         if not keys:
-            self.viewer3d.clear()
+            for k in wanted:
+                self.viewer3d.remove_surface(k)
             self.viewer2d.clear()
             self._update_actions()
             return
@@ -752,8 +862,12 @@ class MainWindow(QtWidgets.QMainWindow):
             PREVIEW_KEY: config.OPACITY_PREVIEW,
         }.get(key, 1.0)
         self.viewer3d.set_surface(key, result["poly"], color, opacity)
+        # モードに合わない面が紛れ込まないようにする
         if key == PREVIEW_KEY:
-            self.viewer3d.set_visible(PREVIEW_KEY, self.show_preview.isChecked())
+            self.viewer3d.set_visible(PREVIEW_KEY, self.preview_mode)
+        else:
+            self.viewer3d.set_visible(
+                key, not self.preview_mode and self._show(key))
 
         n = result["poly"].GetNumberOfPolys()
         self.statusBar().showMessage(
@@ -766,13 +880,18 @@ class MainWindow(QtWidgets.QMainWindow):
         # (別々に撮った CT は患者座標上で遠く離れていることがある)
         if getattr(self, "_focus_preview_when_ready", False):
             self._focus_preview_when_ready = False
+            entry = self._preview_entry
             # CT は体軸に長いので、正面 (A) から見ないと形が読めない
-            if self.viewer3d.focus_on(PREVIEW_KEY, view="前 (A)"):
-                entry = self.series_panel.previewed_entry()
+            self.viewer3d.focus_on(PREVIEW_KEY, view="前 (A)")
+            # 2D も単体表示にする (moving=None で重ね合わせなしになる)
+            self.viewer2d.set_volumes(
+                self._meshes.get(PREVIEW_KEY, {}).get("preview_volume"),
+                None, self.segment_panel.threshold)
+            if entry is not None:
+                n = self._meshes.get(PREVIEW_KEY, {}).get("poly")
                 self.statusBar().showMessage(
-                    f"プレビュー表示: {entry.title if entry else ''}"
-                    "  — [全体表示] で元の視点に戻せます")
-            self.on_transform_changed()
+                    f"プレビュー: {entry.title}"
+                    + (f" — {n.GetNumberOfPolys():,} 三角形" if n else ""))
             self._update_actions()
             return
 
@@ -929,11 +1048,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rebuild_previews()
 
     def on_export(self):
-        entry = self.series_panel.by_role(ROLE_FIXED)
+        entry = self._export_target()
         if entry is None or not entry.loaded:
             QtWidgets.QMessageBox.information(
                 self, "書き出し対象がありません",
-                "書き出すシリーズを Fixed に設定してください。")
+                "一覧でシリーズを選んでください。" if self.preview_mode
+                else "書き出すシリーズを Fixed に設定してください。")
             return
 
         default = str(Path.home() / f"{entry.volume.name.replace(' ', '_')}.stl")
@@ -961,11 +1081,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._on_export_done, "STL を書き出し中…")
 
     def on_export_dicom(self):
-        entry = self.series_panel.by_role(ROLE_FIXED)
+        entry = self._export_target()
         if entry is None or not entry.loaded:
             QtWidgets.QMessageBox.information(
                 self, "書き出し対象がありません",
-                "書き出すシリーズを Fixed に設定してください。")
+                "一覧でシリーズを選んでください。" if self.preview_mode
+                else "書き出すシリーズを Fixed に設定してください。")
             return
 
         parent = QtWidgets.QFileDialog.getExistingDirectory(
@@ -1032,10 +1153,11 @@ class MainWindow(QtWidgets.QMainWindow):
     # ==================================================================
     # 共通
     # ==================================================================
-    def _start(self, worker, on_done, message: str):
+    def _start(self, worker, on_done, message: str, quiet: bool = False):
         if self.runner.busy:
-            QtWidgets.QMessageBox.information(
-                self, "処理中", "別の処理を実行中です。完了までお待ちください。")
+            if not quiet:
+                QtWidgets.QMessageBox.information(
+                    self, "処理中", "別の処理を実行中です。完了までお待ちください。")
             return
         try:
             self.runner.done.disconnect()
@@ -1047,6 +1169,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_busy_changed(self, busy: bool):
         self.progress.set_busy(busy)
+        if not busy and self._pending_preview is not None and self.preview_mode:
+            # 連打で中断させた要求を、ここで最新のものだけ拾って開始する
+            QtCore.QTimer.singleShot(0, self._fire_pending_preview)
         for w in (self.series_panel, self.segment_panel, self.merge_panel):
             w.setEnabled(not busy)
         self.align_panel.set_enabled_controls(not busy)
@@ -1059,21 +1184,41 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.critical(self, "エラー", message)
         self.progress.set_message("エラーが発生しました")
 
+    def _export_target(self):
+        """STL / DICOM 書き出しの対象。
+
+        プレビュー中は「いま見ているもの」を書き出せたほうが自然なので、
+        表示中のシリーズを対象にする。位置合わせ中は従来どおり Fixed。
+        """
+        return self._preview_entry if self.preview_mode else \
+            self.series_panel.by_role(ROLE_FIXED)
+
     def _update_actions(self):
         fixed = self.series_panel.by_role(ROLE_FIXED)
         moving = self.series_panel.by_role(ROLE_MOVING)
         busy = self.runner.busy
 
+        # 結合は位置合わせモード専用
         has_both = fixed is not None and moving is not None
         self.merge_panel.set_merge_enabled(
-            has_both and not busy,
-            self._why_disabled(fixed, moving, busy, need_moving=True))
+            not self.preview_mode and has_both and not busy,
+            "プレビュー中は結合できません。[位置合わせ] タブに切り替えてください。"
+            if self.preview_mode
+            else self._why_disabled(fixed, moving, busy, need_moving=True))
 
-        can_export = fixed is not None and fixed.loaded and not busy
-        self.merge_panel.set_export_enabled(
-            can_export, self._why_disabled(fixed, moving, busy, need_moving=False))
+        target = self._export_target()
+        can_export = target is not None and target.loaded and not busy
+        if self.preview_mode:
+            reason = ("" if can_export
+                      else "読み込み済みのシリーズを一覧で選んでください。")
+        else:
+            reason = self._why_disabled(fixed, moving, busy, need_moving=False)
+        self.merge_panel.set_export_enabled(can_export, reason)
+        self.merge_panel.set_export_target_label(
+            target.title if (can_export and self.preview_mode) else "")
+
         self.align_panel.set_enabled_controls(
-            self.series_panel.by_role(ROLE_MOVING) is not None and not self.runner.busy)
+            not self.preview_mode and moving is not None and not busy)
 
     @staticmethod
     def _why_disabled(fixed, moving, busy, need_moving: bool) -> str:

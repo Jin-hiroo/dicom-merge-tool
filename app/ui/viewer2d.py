@@ -81,7 +81,8 @@ class Viewer2D(QtWidgets.QWidget):
         layout.addWidget(self.tabs, 1)
 
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Moving の濃さ"))
+        self.alpha_label = QtWidgets.QLabel("Moving の濃さ")
+        row.addWidget(self.alpha_label)
         self.alpha_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.alpha_slider.setRange(0, 100)
         self.alpha_slider.setValue(55)
@@ -99,6 +100,11 @@ class Viewer2D(QtWidgets.QWidget):
         self._fixed, self._moving = fixed, moving
         self._threshold = float(threshold)
         self._bounds = self._combined_bounds()
+        # 単体表示のときに「Moving = 赤」と出ていると紛らわしい
+        single = moving is None
+        self.hint.setText("単体表示" if single else "Fixed = グレー / Moving = 赤")
+        self.alpha_slider.setVisible(not single)
+        self.alpha_label.setVisible(not single)
         self.refresh()
 
     def set_transform(self, matrix):
