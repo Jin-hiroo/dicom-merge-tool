@@ -17,7 +17,8 @@ class MergePanel(QtWidgets.QGroupBox):
         layout.setSpacing(4)
 
         blend_row = QtWidgets.QHBoxLayout()
-        blend_row.addWidget(QtWidgets.QLabel("ブレンド"))
+        self.blend_label = QtWidgets.QLabel("ブレンド")
+        blend_row.addWidget(self.blend_label)
         self.blend = QtWidgets.QComboBox()
         self.blend.addItems(config.BLEND_MODES)
         self.blend.setCurrentText(config.DEFAULT_BLEND)
@@ -149,10 +150,25 @@ class MergePanel(QtWidgets.QGroupBox):
     def set_grid_text(self, text: str):
         self.grid_label.setText(text)
 
+    def set_align_widgets_visible(self, visible: bool):
+        """結合まわりは位置合わせ専用。プレビュー中は畳んで紛れをなくす。"""
+        for w in (self.blend, self.blend_hint, self.grid_label, self.merge_btn):
+            w.setVisible(visible)
+        self.blend_label.setVisible(visible)
+
     def set_merge_enabled(self, enabled: bool, reason: str = ""):
         self.merge_btn.setEnabled(bool(enabled))
         self.merge_btn.setToolTip(
             reason if not enabled else "位置合わせ済みの 2 つをボリューム空間で融合する")
+
+    def set_export_target_label(self, title: str):
+        """プレビュー中は「何を書き出すのか」を明示する。"""
+        if title:
+            self.export_hint.setText(f"書き出し対象: {title}")
+            self.export_hint.setStyleSheet("color:#7fd4a0; font-size:11px;")
+            self.export_hint.setVisible(True)
+        elif self.export_btn.isEnabled():
+            self.export_hint.setVisible(False)
 
     def set_export_enabled(self, enabled: bool, reason: str = ""):
         """無効なときは、なぜ押せないのかが分かるようにする。
@@ -167,7 +183,9 @@ class MergePanel(QtWidgets.QGroupBox):
                 "ボリュームを CT DICOM シリーズとして書き出す。\n"
                 "3D Slicer や PACS ビューアでそのまま開ける。")
             self.export_hint.setVisible(False)
+            self.export_hint.setStyleSheet("color:#c9a227; font-size:11px;")
         else:
+            self.export_hint.setStyleSheet("color:#c9a227; font-size:11px;")
             for b in (self.export_btn, self.export_dicom_btn):
                 b.setToolTip(reason)
             self.export_hint.setText(reason)
