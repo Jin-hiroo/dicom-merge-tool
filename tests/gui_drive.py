@@ -18,8 +18,10 @@ import pydicom                                                # noqa: E402
 import vtk                                                    # noqa: E402
 from PyQt5 import QtCore, QtWidgets                           # noqa: E402
 
+from app import config                                        # noqa: E402
 from app.ui.main_window import DARK_QSS, MainWindow           # noqa: E402
-from app.ui.series_panel import ROLE_FIXED, ROLE_MOVING       # noqa: E402
+from app.ui.series_panel import (ROLE_FIXED, ROLE_MOVING,     # noqa: E402
+                                 color_for_key)
 from tests.make_phantom import build                          # noqa: E402
 
 OUT = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/gui_out")
@@ -127,6 +129,28 @@ def main():
     pump(app, 0.3)
     print("    " + window.align_panel.metric_label.text().replace("\n", " | "))
     shot(window, "01_misaligned")
+
+    print("\n=== [2b] シリーズごとの表示色を変える ===")
+    red = (0.90, 0.38, 0.38)
+    window.series_panel.list.setCurrentRow(1)
+    window.series_panel._apply_color(red)
+    pump(app, 0.3)
+    got = window.viewer3d._actors[ROLE_MOVING].GetProperty().GetColor()
+    print(f"    Moving の色: {tuple(round(c, 3) for c in got)}")
+    assert all(abs(a - b) < 1e-3 for a, b in zip(got, red)), \
+        f"指定色が 3D に反映されていない: {got}"
+    # 色替えでメッシュを作り直していないこと (位置合わせ中でも巻き戻らない)
+    assert not window.runner.busy, "色替えで再メッシュが走っている"
+    # 役割を跨いでも指定色が保たれること
+    assert color_for_key(window.series_panel.entries[1], ROLE_FIXED) == red
+    shot(window, "01b_series_color")
+
+    print("    既定に戻す")
+    window.series_panel._apply_color(None)
+    pump(app, 0.3)
+    got = window.viewer3d._actors[ROLE_MOVING].GetProperty().GetColor()
+    assert all(abs(a - b) < 1e-3 for a, b in zip(got, config.COLOR_MOVING)), \
+        f"既定色に戻っていない: {got}"
 
     print("\n=== [3] X/Y/Z・回転ボタンで位置合わせ ===")
     before = window.metric.evaluate(window.align_panel.transform.matrix())

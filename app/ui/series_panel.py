@@ -3,13 +3,67 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
+from app import config
 from app.core.memory import human
 
 ROLE_NONE, ROLE_FIXED, ROLE_MOVING = "", "fixed", "moving"
 # 役割とは別枠。Fixed/Moving を割り当てずに単体で 3D 確認するための表示。
 PREVIEW_KEY = "preview"
+
+# 色を指定していないシリーズが、表示スロットごとに使う既定色。
+DEFAULT_COLORS = {
+    ROLE_FIXED: config.COLOR_FIXED,
+    ROLE_MOVING: config.COLOR_MOVING,
+    PREVIEW_KEY: config.COLOR_PREVIEW,
+}
+
+
+def display_key(entry) -> str:
+    """その行が今どの表示スロットで出ているか。どこにも出ていなければ ""。"""
+    if entry.role:
+        return entry.role
+    return PREVIEW_KEY if entry.previewed else ""
+
+
+def color_for_key(entry, key: str) -> tuple:
+    """表示キーに使う色。シリーズに指定色があればそれを優先する。
+
+    未指定なら役割ごとの既定色に落ちる。どのスロットにも出ていない行は
+    「表示したときに役割の色になる」という意味でニュートラルな灰を返す。
+    """
+    if entry is not None and entry.color:
+        return tuple(entry.color)
+    return DEFAULT_COLORS.get(key, config.COLOR_MERGED)
+
+
+def normalize_color(value) -> tuple | None:
+    """セッション JSON 由来の色を (r,g,b) float へ正規化する。
+
+    手で編集されたマニフェストでも落ちないよう、壊れていれば None
+    (= 既定色) として扱う。
+    """
+    if value is None:
+        return None
+    try:
+        rgb = [float(v) for v in value]
+    except (TypeError, ValueError):
+        return None
+    if len(rgb) != 3:
+        return None
+    return tuple(min(max(c, 0.0), 1.0) for c in rgb)
+
+
+def color_icon(color, size: int = 12) -> QtGui.QIcon:
+    """色見本のアイコン。DARK_QSS の影響を受けないよう描画で作る。"""
+    pix = QtGui.QPixmap(size, size)
+    pix.fill(QtGui.QColor.fromRgbF(*color))
+    painter = QtGui.QPainter(pix)
+    painter.setPen(QtGui.QColor("#0d0f13"))
+    painter.drawRect(0, 0, size - 1, size - 1)
+    painter.end()
+    return QtGui.QIcon(pix)
 
 
 @dataclass
@@ -21,6 +75,8 @@ class SeriesEntry:
     merged: bool = False
     role: str = ROLE_NONE
     previewed: bool = False      # 単体プレビュー中か (同時に 1 件だけ)
+    # 3D の表示色 (r,g,b) 0.0-1.0。None なら表示スロットごとの既定色を使う。
+    color: tuple | None = None
     meta: dict = field(default_factory=dict)
     # セッション復元用: 元 DICOM の在り処 ({"folder":…, "series_uid":…})。
     # 元シリーズは数 GB になりうるのでセッションには実体を持たず、ここから読み直す。
@@ -53,6 +109,7 @@ class SeriesPanel(QtWidgets.QGroupBox):
     roles_changed = QtCore.pyqtSignal()
     remove_requested = QtCore.pyqtSignal(int)
     preview_changed = QtCore.pyqtSignal()           # 単体プレビューの対象が変わった
+    color_changed = QtCore.pyqtSignal(int)          # entry index (表示色のみ変更)
 
     def __init__(self, parent=None):
         super().__init__("シリーズ", parent)
@@ -71,6 +128,7 @@ class SeriesPanel(QtWidgets.QGroupBox):
         self.list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.list.setTextElideMode(QtCore.Qt.ElideMiddle)
         self.list.setWordWrap(False)
+        self.list.setIconSize(QtCore.QSize(12, 12))
         self.list.currentRowChanged.connect(self._on_selection)
         layout.addWidget(self.list, 1)
 
@@ -93,6 +151,13 @@ class SeriesPanel(QtWidgets.QGroupBox):
             "位置合わせ中の Fixed / Moving はそのまま維持される。")
         self.preview_btn.clicked.connect(self._toggle_preview)
         layout.addWidget(self.preview_btn)
+
+        self.color_btn = QtWidgets.QPushButton("表示色…")
+        self.color_btn.setToolTip(
+            "選択中のシリーズを 3D で表示するときの色を決める。\n"
+            "Fixed / Moving / プレビューのどれで表示されても、この色が使われる。")
+        self.color_btn.clicked.connect(self._choose_color)
+        layout.addWidget(self.color_btn)
 
         role_row = QtWidgets.QHBoxLayout()
         self.fixed_btn = QtWidgets.QPushButton("Fixed に設定")
@@ -152,6 +217,7 @@ class SeriesPanel(QtWidgets.QGroupBox):
             mark = "●" if e.loaded else "○"
             prefix = "⧉ " if e.merged else ""
             item = QtWidgets.QListWidgetItem(f"{mark} {prefix}{e.title}{tag}")
+            item.setIcon(color_icon(color_for_key(e, display_key(e))))
             item.setToolTip(f"{e.title}\n{e.detail()}")
             self.list.addItem(item)
         self.list.blockSignals(False)
@@ -215,6 +281,46 @@ class SeriesPanel(QtWidgets.QGroupBox):
         self.refresh()
         self.roles_changed.emit()
 
+    def _choose_color(self):
+        """パレットから選ぶ。末尾から任意色 / 既定へのリセットもできる。"""
+        entry = self.current_entry()
+        if entry is None:
+            return
+        current = color_for_key(entry, display_key(entry))
+
+        menu = QtWidgets.QMenu(self)
+        for name, rgb in config.SERIES_COLOR_PRESETS:
+            act = menu.addAction(color_icon(rgb, 14), name)
+            act.setData(tuple(rgb))
+        menu.addSeparator()
+        custom_act = menu.addAction("その他の色…")
+        reset_act = menu.addAction("既定に戻す")
+        reset_act.setEnabled(entry.color is not None)
+
+        chosen = menu.exec_(self.color_btn.mapToGlobal(
+            QtCore.QPoint(0, self.color_btn.height())))
+        if chosen is None:
+            return
+        if chosen is reset_act:
+            self._apply_color(None)
+        elif chosen is custom_act:
+            c = QtWidgets.QColorDialog.getColor(
+                QtGui.QColor.fromRgbF(*current), self, "表示色を選択")
+            if c.isValid():
+                self._apply_color((c.redF(), c.greenF(), c.blueF()))
+        else:
+            self._apply_color(chosen.data())
+
+    def _apply_color(self, color):
+        """選んだ色をシリーズへ反映する。メッシュは作り直さない。"""
+        row = self.list.currentRow()
+        entry = self.entry(row)
+        if entry is None or entry.color == color:
+            return
+        entry.color = color
+        self.refresh()
+        self.color_changed.emit(row)
+
     def _on_selection(self, row: int):
         entry = self.entry(row)
         self.detail.setText(entry.detail() if entry else "—")
@@ -232,6 +338,11 @@ class SeriesPanel(QtWidgets.QGroupBox):
         self.preview_btn.setEnabled(loaded)
         self.preview_btn.setText(
             "プレビューを閉じる" if (entry and entry.previewed) else "プレビュー表示")
+        # 色は未読込でも先に決めておける (表示したときに効く)
+        self.color_btn.setEnabled(has)
+        self.color_btn.setIcon(
+            color_icon(color_for_key(entry, display_key(entry)), 14)
+            if has else QtGui.QIcon())
         if loaded:
             self.load_btn.setText("読み込み済み")
         else:

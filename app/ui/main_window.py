@@ -25,7 +25,8 @@ from app.ui.merge_panel import MergePanel
 from app.ui.progress_bar import ProgressBar
 from app.ui.segment_panel import SegmentPanel
 from app.ui.series_panel import (PREVIEW_KEY, ROLE_FIXED, ROLE_MOVING,
-                                 SeriesEntry, SeriesPanel)
+                                 SeriesEntry, SeriesPanel, color_for_key,
+                                 normalize_color)
 from app.ui.viewer2d import Viewer2D
 from app.ui.viewer3d import VIEW_DIRECTIONS, Viewer3D
 from app.workers.base import TaskRunner
@@ -273,6 +274,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.series_panel.roles_changed.connect(self.on_roles_changed)
         self.series_panel.remove_requested.connect(self.on_remove_entry)
         self.series_panel.preview_changed.connect(self.on_preview_changed)
+        self.series_panel.color_changed.connect(self.on_series_color_changed)
 
         self.segment_panel.apply_requested.connect(self.rebuild_previews)
         self.segment_panel.threshold_preview.connect(self.on_threshold_preview)
@@ -530,6 +532,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 title=rec["title"], role=rec.get("role", ""),
                 merged=bool(rec.get("merged")), meta=rec.get("meta", {}),
                 volume=rec.get("volume"), info=rec.get("info"),
+                color=normalize_color(rec.get("color")),
                 dicom_ref=rec.get("dicom"))
             entries.append(entry)
         self.series_panel.add_entries(entries)
@@ -669,6 +672,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mesh_queue = [PREVIEW_KEY]
         self._next_mesh()
 
+    def on_series_color_changed(self, index: int):
+        """表示色だけの変更。
+
+        メッシュは作り直さず、アクタのプロパティだけ差し替える
+        (透過スライダと同じ経路)。位置合わせ中に色を変えても作業が
+        巻き戻らないようにするため。
+        """
+        entry = self.series_panel.entry(index)
+        if entry is None:
+            return
+        for key in (ROLE_FIXED, ROLE_MOVING, PREVIEW_KEY):
+            if self._entry_for(key) is entry and self.viewer3d.has(key):
+                self.viewer3d.set_color(key, color_for_key(entry, key))
+
     def on_threshold_preview(self, value: int):
         self.viewer2d.set_threshold(value)
         self.statusBar().showMessage(
@@ -728,12 +745,12 @@ class MainWindow(QtWidgets.QMainWindow):
         key = result["role"]
         self._meshes[key] = result
 
-        color, opacity = {
-            ROLE_FIXED: (config.COLOR_FIXED, config.OPACITY_FIXED),
-            ROLE_MOVING: (config.COLOR_MOVING,
-                          self.moving_opacity.value() / 100.0),
-            PREVIEW_KEY: (config.COLOR_PREVIEW, config.OPACITY_PREVIEW),
-        }.get(key, (config.COLOR_MERGED, 1.0))
+        color = color_for_key(self._entry_for(key), key)
+        opacity = {
+            ROLE_FIXED: config.OPACITY_FIXED,
+            ROLE_MOVING: self.moving_opacity.value() / 100.0,
+            PREVIEW_KEY: config.OPACITY_PREVIEW,
+        }.get(key, 1.0)
         self.viewer3d.set_surface(key, result["poly"], color, opacity)
         if key == PREVIEW_KEY:
             self.viewer3d.set_visible(PREVIEW_KEY, self.show_preview.isChecked())

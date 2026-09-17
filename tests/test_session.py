@@ -3,6 +3,7 @@
 肝心なのは「アプリを閉じても作業が失われない」こと。特に結合結果は
 位置合わせをやり直さないと再現できないので、実体が確実に残ること。
 """
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,6 +21,7 @@ class FakeEntry:
     role: str = ""
     merged: bool = False
     volume: object = None
+    color: tuple | None = None
     meta: dict = field(default_factory=dict)
     dicom_ref: dict | None = None
 
@@ -40,7 +42,8 @@ def entries(volumes, merged_vol, phantom):
                   dicom_ref={"folder": str(phantom["folder_a"]),
                              "series_uid": volumes[0].meta["series_uid"]}),
         FakeEntry(title="結合結果 #1", role="fixed", merged=True,
-                  volume=merged_vol, meta={"source_count": 2}),
+                  volume=merged_vol, color=(0.90, 0.38, 0.38),
+                  meta={"source_count": 2}),
     ]
 
 
@@ -186,3 +189,33 @@ def test_meta_with_numpy_is_serializable(entries, tmp_path):
     data = session.load_session(out)
     meta = [e for e in data["entries"] if e["kind"] == "volume"][0]["meta"]
     assert meta["overlap_mm"] == 40.0 and meta["count"] == 3
+
+
+# ----------------------------------------------------------------------
+# 表示色
+# ----------------------------------------------------------------------
+def test_roundtrip_restores_color(entries, tmp_path):
+    """シリーズごとの表示色が保存・復元されること。"""
+    out = tmp_path / "sess"
+    session.save_session(out, entries, SETTINGS, copy_volumes=True)
+    data = session.load_session(out)
+    colors = {e["title"]: e["color"] for e in data["entries"]}
+    assert colors["結合結果 #1"] == pytest.approx([0.90, 0.38, 0.38])
+    # 色を指定していない行は None のまま (= 既定色にフォールバックする)
+    assert colors["PHANTOM A"] is None
+
+
+def test_manifest_without_color_still_loads(entries, tmp_path):
+    """color キーを持たない旧セッションも読めること (後方互換)。"""
+    out = tmp_path / "sess"
+    session.save_session(out, entries, SETTINGS, copy_volumes=True)
+
+    path = session.manifest_path(out)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for rec in data["entries"]:
+        rec.pop("color", None)
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    restored = session.load_session(out)
+    assert not restored["problems"]
+    assert all(e["color"] is None for e in restored["entries"])

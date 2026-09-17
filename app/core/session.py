@@ -108,8 +108,9 @@ def save_session(folder, entries, settings: dict,
     Parameters
     ----------
     entries
-        (title, role, merged, volume, dicom_ref, meta) を持つオブジェクトの列。
-        ``dicom_ref`` は {"folder":…, "series_uid":…} または None。
+        (title, role, merged, volume, dicom_ref, meta, color) を持つ
+        オブジェクトの列。``dicom_ref`` は {"folder":…, "series_uid":…}
+        または None。``color`` は (r,g,b) 0.0-1.0 または None (既定色)。
     copy_volumes
         True なら結合結果の実体をセッション内へコピーして自己完結させる。
         False (自動保存) なら scratch 上の実体を絶対パスで参照するだけ。
@@ -127,10 +128,13 @@ def save_session(folder, entries, settings: dict,
     for entry in entries:
         if cancel_cb and cancel_cb():
             return None
+        # color を持たない呼び出し元 (テストの簡易エントリなど) も壊さない
+        color = getattr(entry, "color", None)
         rec = {
             "title": entry.title,
             "role": entry.role,
             "merged": bool(entry.merged),
+            "color": [float(c) for c in color] if color else None,
             "meta": _jsonable(entry.meta),
         }
 
@@ -260,12 +264,14 @@ def load_session(folder, progress_cb=None, cancel_cb=None) -> dict:
                 volume = volume_from_dict(rec["volume"], folder)
                 restored.append({"kind": "volume", "title": rec.get("title", volume.name),
                                  "role": rec.get("role", ""), "merged": True,
-                                 "volume": volume, "meta": rec.get("meta", {})})
+                                 "volume": volume, "color": rec.get("color"),
+                                 "meta": rec.get("meta", {})})
             elif rec.get("kind") == "dicom":
                 restored.append({"kind": "dicom", "title": rec.get("title", ""),
                                  "role": rec.get("role", ""), "merged": False,
                                  "dicom": rec.get("dicom", {}),
                                  "was_loaded": bool(rec.get("was_loaded")),
+                                 "color": rec.get("color"),
                                  "meta": rec.get("meta", {})})
         except (FileNotFoundError, ValueError, OSError) as exc:
             problems.append(f"{rec.get('title', '(無題)')}: {exc}")
